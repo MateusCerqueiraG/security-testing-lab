@@ -1,0 +1,86 @@
+name: Security Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run security tests (start API + pytest)
+        run: |
+          uvicorn app.main:app --host 127.0.0.1 --port 8000 &
+          APP=$!
+          for i in $(seq 1 20); do curl -sf http://127.0.0.1:8000/health >/dev/null && break; sleep 1; done
+          set +e
+          pytest --reruns 2 --reruns-delay 2 --alluredir=allure-results
+          code=$?
+          kill "$APP" 2>/dev/null || true
+          exit $code
+
+      - name: Upload Allure results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: allure-results
+          path: allure-results
+          if-no-files-found: ignore
+
+  report:
+    name: Publish Allure report
+    needs: security
+    if: ${{ always() && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Allure results
+        uses: actions/download-artifact@v4
+        with:
+          name: allure-results
+          path: allure-results
+
+      - name: Load previous report history
+        uses: actions/checkout@v4
+        continue-on-error: true
+        with:
+          ref: gh-pages
+          path: gh-pages
+
+      - name: Build Allure report
+        uses: simple-elf/allure-report-action@master
+        with:
+          allure_results: allure-results
+          gh_pages: gh-pages
+          allure_report: allure-report
+          allure_history: allure-history
+
+      - name: Publish report to gh-pages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" allure-history
+          cd allure-history
+          rm -rf .git
+          touch .nojekyll
+          git init -q
+          git checkout -B gh-pages
+          git add -A
+          git -c user.name='github-actions[bot]' \
+              -c user.email='github-actions[bot]@users.noreply.github.com' \
+              commit -q -m "Allure report for ${GITHUB_SHA::7}"
+          git push -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" gh-pages
